@@ -1,3 +1,1 @@
-2-d physics rogue-lite platformer shooter
-
-https://landgreen.github.io/n-gon/
+n-gon but better will feature new vanilla movement including sliding, wall jumping, ground pound (obtainable through an ability) and rolling. New items and abilities will also be introduced later on in development.
