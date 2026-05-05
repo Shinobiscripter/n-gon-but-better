@@ -104,6 +104,29 @@ const m = {
     numTouching: 0,
     crouch: false,
     // isHeadClear: true,
+
+    // --- sliding ---
+    sliding: false,
+    slideCD: 0,          // cooldown so you can't spam-slide
+    slideDuration: 30,   // cycles a slide lasts
+    slideStartCycle: 0,
+
+    // --- wall jumping ---
+    wallJumpCD: 0,       // cooldown between wall jumps
+    onWallLeft: false,   // touching a wall on the left
+    onWallRight: false,  // touching a wall on the right
+    wallSlideTimer: 0,   // how long we've been on a wall this contact
+    wallSensorWidth: 22, // horizontal ray distance for wall detection
+    wallSensorTop: 20,   // y offsets for the two wall-check rays
+    wallSensorBot: 70,
+
+    // --- rolling ---
+    rolling: false,
+    rollCD: 0,
+    rollDuration: 35,    // cycles the roll animation/boost lasts
+    rollStartCycle: 0,
+    rollPending: false,  // set in air, consumed on landing
+
     spawnPos: {
         x: 0,
         y: 0
@@ -256,11 +279,47 @@ const m = {
     moverX: 0, //used to tell the player about moving platform x velocity
     groundControl() {
         const moveX = player.velocity.x - m.moverX //account for mover platforms
+
+        // ── ROLL ON LANDING: consume pending roll flag set while airborne ──
+        if (m.rollPending && !m.rolling && m.cycle > m.rollCD) {
+            m.startRoll();
+        }
+        m.rollPending = false; // clear each ground frame
+
+        // ── ROLLING: land while holding down + moving fast → start roll ──
+        if (m.rolling) {
+            if (m.cycle > m.rollStartCycle + m.rollDuration || (!input.down && m.checkHeadClear())) {
+                m.endRoll();
+            }
+            // during roll: reduced friction (let momentum carry)
+            Matter.Body.setVelocity(player, { x: player.velocity.x * 0.97, y: player.velocity.y });
+            m.moverX = 0;
+            return; // skip normal ground control while rolling
+        }
+
         //check for crouch or jump
         if (m.crouch) {
+            // ── SLIDING: already crouched on ground while moving fast ──
+            if (!m.sliding && input.down && Math.abs(moveX) > 4 && m.cycle > m.slideCD) {
+                m.startSlide();
+            }
+            if (m.sliding) {
+                if (m.cycle > m.slideStartCycle + m.slideDuration || (!input.down && m.checkHeadClear())) {
+                    m.endSlide();
+                }
+                // during slide: low friction, can't steer
+                Matter.Body.setVelocity(player, { x: player.velocity.x * 0.975, y: player.velocity.y });
+                m.moverX = 0;
+                return; // skip normal steering while sliding
+            }
             if (!(input.down) && m.checkHeadClear() && m.hardLandCD < m.cycle) m.undoCrouch();
         } else if (input.down || m.hardLandCD > m.cycle) {
-            m.doCrouch(); //on ground && not crouched and pressing s or down
+            // ── SLIDING: press down while running fast → initiate slide ──
+            if (Math.abs(moveX) > 4 && m.cycle > m.slideCD) {
+                m.startSlide();
+            } else {
+                m.doCrouch(); //on ground && not crouched and pressing s or down
+            }
         } else if (input.up && m.buttonCD_jump + 20 < m.cycle) { //&& (m.groundCount > 2 || Math.abs(player.velocity) > 8)
             // console.log("ground", m.groundCount, player.speed, player.velocity)
             m.jump()
@@ -291,6 +350,36 @@ const m = {
         m.moverX = 0 //reset the level mover offset
     },
     airControl() {
+        // detect walls every air frame
+        m.checkWalls();
+
+        // ── WALL SLIDING: slow fall when hugging a wall ──
+        if ((m.onWallLeft && input.left) || (m.onWallRight && input.right)) {
+            m.wallSlideTimer++;
+            if (m.Vy > 1.5) { // only slow falling, not rising
+                Matter.Body.setVelocity(player, { x: player.velocity.x, y: player.velocity.y * 0.88 });
+            }
+        } else {
+            m.wallSlideTimer = 0;
+        }
+
+        // ── WALL JUMP: press jump while on a wall ──
+        if (input.up && m.buttonCD_jump + 20 < m.cycle && m.cycle > m.wallJumpCD) {
+            if (m.onWallLeft) {
+                m.doWallJump(1);   // jump away from left wall → push right
+                return;
+            } else if (m.onWallRight) {
+                m.doWallJump(-1);  // jump away from right wall → push left
+                return;
+            }
+        }
+
+        // ── ROLLING: press down while falling fast → roll on landing ──
+        // We set a pending flag; the actual roll starts when grounded (handled in groundControl)
+        if (input.down && !m.rolling && m.Vy > 5 && m.cycle > m.rollCD) {
+            m.rollPending = true;
+        }
+
         //check for coyote time jump
         if (input.up && m.buttonCD_jump + 20 < m.cycle && m.lastOnGroundCycle + m.coyoteCycles > m.cycle) { //&& (m.groundCount > 2 || Math.abs(player.velocity) > 8)
             // console.log("air", m.groundCount, player.speed, player.velocity)
@@ -308,6 +397,58 @@ const m = {
             if (player.velocity.x < m.airSpeedLimit / player.mass / player.mass) player.force.x += m.FxAir; //move player  right / d
         }
     },
+    // ── SLIDE ────────────────────────────────────────────────────────────
+    startSlide() {
+        m.sliding = true;
+        m.slideStartCycle = m.cycle;
+        m.slideCD = m.cycle + 60; // 1 second cooldown after a slide ends
+        m.doCrouch();
+        // give a horizontal speed boost in the direction of travel
+        const boostDir = (m.Vx >= 0) ? 1 : -1;
+        const boostSpeed = Math.max(Math.abs(m.Vx), 5); // at least speed 5
+        Matter.Body.setVelocity(player, { x: boostDir * (boostSpeed + 3), y: player.velocity.y });
+    },
+    endSlide() {
+        m.sliding = false;
+        if (m.checkHeadClear()) m.undoCrouch();
+    },
+
+    // ── WALL JUMP ─────────────────────────────────────────────────────────
+    checkWalls() {
+        const top = m.pos.y - m.wallSensorTop;
+        const bot = m.pos.y + m.wallSensorBot;
+        m.onWallLeft  = !m.onGround &&
+            Matter.Query.ray(map, { x: m.pos.x - m.wallSensorWidth, y: top },
+                                   { x: m.pos.x - m.wallSensorWidth, y: bot }).length > 0;
+        m.onWallRight = !m.onGround &&
+            Matter.Query.ray(map, { x: m.pos.x + m.wallSensorWidth, y: top },
+                                   { x: m.pos.x + m.wallSensorWidth, y: bot }).length > 0;
+    },
+    doWallJump(dir) {
+        // dir: -1 = jumping off left wall (push right), 1 = jumping off right wall (push left)
+        m.wallJumpCD = m.cycle + 25;
+        m.buttonCD_jump = m.cycle;
+        const wallJumpX = dir * (m.airSpeedLimit / player.mass / player.mass) * 1.1;
+        Matter.Body.setVelocity(player, { x: wallJumpX, y: 0 });
+        player.force.y = -m.jumpForce * 0.95;
+        m.yOffGoal = m.yOffWhen.jump;
+    },
+
+    // ── ROLL ──────────────────────────────────────────────────────────────
+    startRoll() {
+        m.rolling = true;
+        m.rollStartCycle = m.cycle;
+        m.rollCD = m.cycle + 70;
+        m.doCrouch();
+        // small forward speed boost to reward timing
+        const dir = (m.Vx >= 0) ? 1 : -1;
+        Matter.Body.setVelocity(player, { x: dir * Math.max(Math.abs(m.Vx) * 1.15, 4), y: player.velocity.y * 0.5 });
+    },
+    endRoll() {
+        m.rolling = false;
+        if (m.checkHeadClear()) m.undoCrouch();
+    },
+
     printBlock() {
         const sides = Math.floor(4 + 6 * Math.random() * Math.random())
         body[body.length] = Matter.Bodies.polygon(m.pos.x, m.pos.y, sides, 8, {
