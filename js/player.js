@@ -105,28 +105,23 @@ const m = {
     crouch: false,
     // isHeadClear: true,
 
-    // --- sliding ---
+    // ── SLIDE state ──────────────────────────────────────────────────────
     sliding: false,
-    slideCD: 0,          // cooldown so you can't spam-slide
-    slideDuration: 30,   // cycles a slide lasts
     slideStartCycle: 0,
+    slideEndCycle: 0,    // when slide naturally finishes
+    slideCD: 0,          // next cycle when slide is allowed again
 
-    // --- wall jumping ---
-    wallJumpCD: 0,       // cooldown between wall jumps
-    onWallLeft: false,   // touching a wall on the left
-    onWallRight: false,  // touching a wall on the right
-    wallSlideTimer: 0,   // how long we've been on a wall this contact
-    wallSensorWidth: 22, // horizontal ray distance for wall detection
-    wallSensorTop: 20,   // y offsets for the two wall-check rays
-    wallSensorBot: 70,
+    // ── WALL JUMP state ───────────────────────────────────────────────────
+    onWallLeft: false,
+    onWallRight: false,
+    wallJumpCD: 0,
 
-    // --- rolling ---
+    // ── ROLL state ────────────────────────────────────────────────────────
     rolling: false,
-    rollCD: 0,
-    rollDuration: 35,    // cycles the roll animation/boost lasts
     rollStartCycle: 0,
-    rollPending: false,  // set in air, consumed on landing
-
+    rollEndCycle: 0,
+    rollCD: 0,
+    rollPending: false,  // armed in air, fires on landing
     spawnPos: {
         x: 0,
         y: 0
@@ -278,177 +273,163 @@ const m = {
     },
     moverX: 0, //used to tell the player about moving platform x velocity
     groundControl() {
-        const moveX = player.velocity.x - m.moverX //account for mover platforms
+        const moveX = player.velocity.x - m.moverX; // account for mover platforms
 
-        // ── ROLL ON LANDING: consume pending roll flag set while airborne ──
-        if (m.rollPending && !m.rolling && m.cycle > m.rollCD) {
-            m.startRoll();
+        // ── ROLLING: consume pending roll set while airborne ──────────────
+        if (m.rollPending) {
+            m.rollPending = false;
+            if (m.cycle > m.rollCD && Math.abs(moveX) > 2) {
+                // start roll: crouch, brief speed boost, low-friction glide
+                m.rolling = true;
+                m.rollStartCycle = m.cycle;
+                m.rollEndCycle = m.cycle + 40; // ~0.67 s at 60 fps
+                m.rollCD = m.cycle + 80;
+                m.doCrouch();
+                const dir = moveX >= 0 ? 1 : -1;
+                Matter.Body.setVelocity(player, {
+                    x: dir * Math.max(Math.abs(moveX) * 1.1, 4),
+                    y: player.velocity.y * 0.4
+                });
+            }
         }
-        m.rollPending = false; // clear each ground frame
 
-        // ── ROLLING: land while holding down + moving fast → start roll ──
+        // ── ACTIVE ROLL ───────────────────────────────────────────────────
         if (m.rolling) {
-            if (m.cycle > m.rollStartCycle + m.rollDuration || (!input.down && m.checkHeadClear())) {
-                m.endRoll();
+            if (m.cycle >= m.rollEndCycle || (!input.down && m.checkHeadClear())) {
+                m.rolling = false;
+                if (m.checkHeadClear()) m.undoCrouch();
+            } else {
+                // glide with very low friction; no steering
+                Matter.Body.setVelocity(player, { x: player.velocity.x * 0.978, y: player.velocity.y });
+                m.moverX = 0;
+                return;
             }
-            // during roll: reduced friction (let momentum carry)
-            Matter.Body.setVelocity(player, { x: player.velocity.x * 0.97, y: player.velocity.y });
-            m.moverX = 0;
-            return; // skip normal ground control while rolling
         }
 
-        //check for crouch or jump
-        if (m.crouch) {
-            // ── SLIDING: already crouched on ground while moving fast ──
-            if (!m.sliding && input.down && Math.abs(moveX) > 4 && m.cycle > m.slideCD) {
-                m.startSlide();
-            }
-            if (m.sliding) {
-                if (m.cycle > m.slideStartCycle + m.slideDuration || (!input.down && m.checkHeadClear())) {
-                    m.endSlide();
-                }
-                // during slide: low friction, can't steer
-                Matter.Body.setVelocity(player, { x: player.velocity.x * 0.975, y: player.velocity.y });
-                m.moverX = 0;
-                return; // skip normal steering while sliding
-            }
-            if (!(input.down) && m.checkHeadClear() && m.hardLandCD < m.cycle) m.undoCrouch();
-        } else if (input.down || m.hardLandCD > m.cycle) {
-            // ── SLIDING: press down while running fast → initiate slide ──
-            if (Math.abs(moveX) > 4 && m.cycle > m.slideCD) {
-                m.startSlide();
+        // ── ACTIVE SLIDE ──────────────────────────────────────────────────
+        if (m.sliding) {
+            const expired = m.cycle >= m.slideEndCycle;
+            const released = !input.down && m.checkHeadClear();
+            if (expired || released) {
+                m.sliding = false;
+                if (m.checkHeadClear()) m.undoCrouch();
             } else {
-                m.doCrouch(); //on ground && not crouched and pressing s or down
+                // momentum-preserving glide; player cannot steer
+                Matter.Body.setVelocity(player, { x: player.velocity.x * 0.972, y: player.velocity.y });
+                m.moverX = 0;
+                return;
             }
-        } else if (input.up && m.buttonCD_jump + 20 < m.cycle) { //&& (m.groundCount > 2 || Math.abs(player.velocity) > 8)
-            // console.log("ground", m.groundCount, player.speed, player.velocity)
-            m.jump()
         }
-        //Math.abs(player.velocity.x) < 7.5
+
+        // ── CROUCH / JUMP / SLIDE TRIGGER ─────────────────────────────────
+        if (m.crouch) {
+            if (!input.down && m.checkHeadClear() && m.hardLandCD < m.cycle) {
+                m.undoCrouch();
+            }
+        } else if (input.down || m.hardLandCD > m.cycle) {
+            // initiate slide if running fast enough
+            if (input.down && Math.abs(moveX) > 3.5 && m.cycle > m.slideCD) {
+                m.sliding = true;
+                m.slideStartCycle = m.cycle;
+                m.slideEndCycle = m.cycle + 35;
+                m.slideCD = m.cycle + 65; // ~1 s cooldown
+                m.doCrouch();
+                // brief momentum burst in direction of travel
+                const dir = moveX >= 0 ? 1 : -1;
+                Matter.Body.setVelocity(player, {
+                    x: dir * (Math.abs(moveX) + 2.5),
+                    y: player.velocity.y
+                });
+                m.moverX = 0;
+                return;
+            }
+            m.doCrouch();
+        } else if (input.up && m.buttonCD_jump + 20 < m.cycle) {
+            m.jump();
+        }
+
+        // ── HORIZONTAL MOVEMENT ───────────────────────────────────────────
         if (input.left && !input.right) {
             if (moveX > -2) {
-                player.force.x -= m.Fx * 1.5
+                player.force.x -= m.Fx * 1.5;
             } else {
-                player.force.x -= m.Fx
+                player.force.x -= m.Fx;
             }
-            // }
         } else if (input.right && !input.left) {
             if (moveX < 2) {
-                player.force.x += m.Fx * 1.5
+                player.force.x += m.Fx * 1.5;
             } else {
-                player.force.x += m.Fx
+                player.force.x += m.Fx;
             }
         } else {
-            const stoppingFriction = 0.92; //come to a stop if no move key is pressed
+            const stoppingFriction = 0.92;
             Matter.Body.setVelocity(player, { x: m.moverX * 0.08 + player.velocity.x * stoppingFriction, y: player.velocity.y * stoppingFriction });
         }
 
-        if (Math.abs(moveX) > 4) { //come to a stop if fast     // if (player.speed > 4) { //come to a stop if fast 
-            const stoppingFriction = (m.crouch && (input.down || !m.checkHeadClear())) ? 0.65 : 0.89; // this controls speed when crouched 
+        if (Math.abs(moveX) > 4) {
+            const stoppingFriction = (m.crouch && (input.down || !m.checkHeadClear())) ? 0.65 : 0.89;
             Matter.Body.setVelocity(player, { x: m.moverX * (1 - stoppingFriction) + player.velocity.x * stoppingFriction, y: player.velocity.y * stoppingFriction });
         }
-        m.moverX = 0 //reset the level mover offset
+        m.moverX = 0;
     },
     airControl() {
-        // detect walls every air frame
-        m.checkWalls();
+        // ── WALL DETECTION (raycasts left and right of the body) ──────────
+        // Two short vertical rays on each side detect wall contact
+        const wx = 26; // horizontal distance from centre to wall sensor
+        const wyTop = m.pos.y - 15;  // sensor top
+        const wyBot = m.pos.y + 65;  // sensor bottom
+        m.onWallLeft  = Matter.Query.ray(map, { x: m.pos.x - wx, y: wyTop }, { x: m.pos.x - wx, y: wyBot }).length > 0;
+        m.onWallRight = Matter.Query.ray(map, { x: m.pos.x + wx, y: wyTop }, { x: m.pos.x + wx, y: wyBot }).length > 0;
 
-        // ── WALL SLIDING: slow fall when hugging a wall ──
-        if ((m.onWallLeft && input.left) || (m.onWallRight && input.right)) {
-            m.wallSlideTimer++;
-            if (m.Vy > 1.5) { // only slow falling, not rising
-                Matter.Body.setVelocity(player, { x: player.velocity.x, y: player.velocity.y * 0.88 });
-            }
-        } else {
-            m.wallSlideTimer = 0;
+        // ── WALL SLIDE: slow fall while pressing into a wall ──────────────
+        const pressingLeft  = input.left  && !input.right;
+        const pressingRight = input.right && !input.left;
+        const onWall = (m.onWallLeft && pressingLeft) || (m.onWallRight && pressingRight);
+        if (onWall && m.Vy > 1) {
+            // counteract gravity partially so the player slides slowly
+            Matter.Body.setVelocity(player, { x: player.velocity.x, y: player.velocity.y * 0.86 });
         }
 
-        // ── WALL JUMP: press jump while on a wall ──
+        // ── WALL JUMP: press jump while touching a wall ───────────────────
         if (input.up && m.buttonCD_jump + 20 < m.cycle && m.cycle > m.wallJumpCD) {
-            if (m.onWallLeft) {
-                m.doWallJump(1);   // jump away from left wall → push right
-                return;
-            } else if (m.onWallRight) {
-                m.doWallJump(-1);  // jump away from right wall → push left
-                return;
+            if (m.onWallLeft || m.onWallRight) {
+                const dir = m.onWallLeft ? 1 : -1; // jump away from the wall
+                m.wallJumpCD = m.cycle + 20;
+                m.buttonCD_jump = m.cycle;
+                const maxAirX = m.airSpeedLimit / player.mass / player.mass;
+                Matter.Body.setVelocity(player, {
+                    x: dir * maxAirX * 1.05,
+                    y: 0
+                });
+                player.force.y = -m.jumpForce * 0.92;
+                m.yOffGoal = m.yOffWhen.jump;
+                return; // skip coyote / short-jump logic this frame
             }
         }
 
-        // ── ROLLING: press down while falling fast → roll on landing ──
-        // We set a pending flag; the actual roll starts when grounded (handled in groundControl)
-        if (input.down && !m.rolling && m.Vy > 5 && m.cycle > m.rollCD) {
+        // ── ROLL PENDING: arm roll if pressing down while falling fast ────
+        if (input.down && !m.rolling && m.Vy > 4 && m.cycle > m.rollCD) {
             m.rollPending = true;
         }
 
-        //check for coyote time jump
-        if (input.up && m.buttonCD_jump + 20 < m.cycle && m.lastOnGroundCycle + m.coyoteCycles > m.cycle) { //&& (m.groundCount > 2 || Math.abs(player.velocity) > 8)
-            // console.log("air", m.groundCount, player.speed, player.velocity)
-            m.jump()
-        }
-        //check for short jumps   //moving up   //recently pressed jump  //but not pressing jump key now
-        if (m.buttonCD_jump + 60 > m.cycle && !(input.up) && m.Vy < 0) {
-            Matter.Body.setVelocity(player, { x: player.velocity.x, y: player.velocity.y * 0.94 }); //reduce player y-velocity every cycle
+        // ── COYOTE JUMP ───────────────────────────────────────────────────
+        if (input.up && m.buttonCD_jump + 20 < m.cycle && m.lastOnGroundCycle + m.coyoteCycles > m.cycle) {
+            m.jump();
         }
 
+        // ── SHORT JUMP: releasing jump early cuts velocity ─────────────────
+        if (m.buttonCD_jump + 60 > m.cycle && !input.up && m.Vy < 0) {
+            Matter.Body.setVelocity(player, { x: player.velocity.x, y: player.velocity.y * 0.94 });
+        }
+
+        // ── AIR STEERING ──────────────────────────────────────────────────
         if (input.left) {
-            if (player.velocity.x > -m.airSpeedLimit / player.mass / player.mass) player.force.x -= m.FxAir; // move player   left / a
+            if (player.velocity.x > -m.airSpeedLimit / player.mass / player.mass) player.force.x -= m.FxAir;
         }
         if (input.right) {
-            if (player.velocity.x < m.airSpeedLimit / player.mass / player.mass) player.force.x += m.FxAir; //move player  right / d
+            if (player.velocity.x < m.airSpeedLimit / player.mass / player.mass) player.force.x += m.FxAir;
         }
     },
-    // ── SLIDE ────────────────────────────────────────────────────────────
-    startSlide() {
-        m.sliding = true;
-        m.slideStartCycle = m.cycle;
-        m.slideCD = m.cycle + 60; // 1 second cooldown after a slide ends
-        m.doCrouch();
-        // give a horizontal speed boost in the direction of travel
-        const boostDir = (m.Vx >= 0) ? 1 : -1;
-        const boostSpeed = Math.max(Math.abs(m.Vx), 5); // at least speed 5
-        Matter.Body.setVelocity(player, { x: boostDir * (boostSpeed + 3), y: player.velocity.y });
-    },
-    endSlide() {
-        m.sliding = false;
-        if (m.checkHeadClear()) m.undoCrouch();
-    },
-
-    // ── WALL JUMP ─────────────────────────────────────────────────────────
-    checkWalls() {
-        const top = m.pos.y - m.wallSensorTop;
-        const bot = m.pos.y + m.wallSensorBot;
-        m.onWallLeft  = !m.onGround &&
-            Matter.Query.ray(map, { x: m.pos.x - m.wallSensorWidth, y: top },
-                                   { x: m.pos.x - m.wallSensorWidth, y: bot }).length > 0;
-        m.onWallRight = !m.onGround &&
-            Matter.Query.ray(map, { x: m.pos.x + m.wallSensorWidth, y: top },
-                                   { x: m.pos.x + m.wallSensorWidth, y: bot }).length > 0;
-    },
-    doWallJump(dir) {
-        // dir: -1 = jumping off left wall (push right), 1 = jumping off right wall (push left)
-        m.wallJumpCD = m.cycle + 25;
-        m.buttonCD_jump = m.cycle;
-        const wallJumpX = dir * (m.airSpeedLimit / player.mass / player.mass) * 1.1;
-        Matter.Body.setVelocity(player, { x: wallJumpX, y: 0 });
-        player.force.y = -m.jumpForce * 0.95;
-        m.yOffGoal = m.yOffWhen.jump;
-    },
-
-    // ── ROLL ──────────────────────────────────────────────────────────────
-    startRoll() {
-        m.rolling = true;
-        m.rollStartCycle = m.cycle;
-        m.rollCD = m.cycle + 70;
-        m.doCrouch();
-        // small forward speed boost to reward timing
-        const dir = (m.Vx >= 0) ? 1 : -1;
-        Matter.Body.setVelocity(player, { x: dir * Math.max(Math.abs(m.Vx) * 1.15, 4), y: player.velocity.y * 0.5 });
-    },
-    endRoll() {
-        m.rolling = false;
-        if (m.checkHeadClear()) m.undoCrouch();
-    },
-
     printBlock() {
         const sides = Math.floor(4 + 6 * Math.random() * Math.random())
         body[body.length] = Matter.Bodies.polygon(m.pos.x, m.pos.y, sides, 8, {
@@ -1375,6 +1356,195 @@ const m = {
                 ctx.stroke();
                 ctx.restore();
             }
+        },
+        // ── ROBOT SKIN ───────────────────────────────────────────────────
+        // A bipedal robot that retracts its legs and curls into a ball
+        // when sliding, rolling, or wall-sliding.
+        robot() {
+            m.isAltSkin = true;
+            m.yOffWhen.stand = 50;
+            m.yOffWhen.jump  = 68;
+            m.yOffWhen.crouch = 24;
+            m.coyoteCycles = 7;
+            m.hardLandCDScale = 0.8;
+            m.setMovement();
+
+            // Smooth 0→1 "ball" transition factor shared by slide / roll / wall-slide
+            m._robotBallT   = 0; // current interpolated value
+            m._robotBallTgt = 0; // target value this frame
+
+            // ── drawing helpers ──────────────────────────────────────────
+            m.drawLeg = function (stroke) {
+                // Standard robot biped leg — used by defaultDraw path
+                if (m.angle > -Math.PI / 2 && m.angle < Math.PI / 2) {
+                    m.flipLegs = 1;
+                } else {
+                    m.flipLegs = -1;
+                }
+                ctx.save();
+                ctx.scale(m.flipLegs, 1);
+
+                const t = m._robotBallT; // retraction amount 0=extended 1=retracted
+                // hip and foot positions interpolate toward body centre as t→1
+                const hipX  = m.hip.x  * (1 - t);
+                const hipY  = m.hip.y  * (1 - t) + 2 * t;
+                const kneeX = m.knee.x * (1 - t);
+                const kneeY = m.knee.y * (1 - t) + 5 * t;
+                const footX = m.foot.x * (1 - t);
+                const footY = m.foot.y * (1 - t) + m.yOff * t * 0.5;
+
+                const alpha = 1 - t * 0.9; // legs fade out as they retract
+                ctx.globalAlpha *= alpha;
+
+                // upper leg
+                ctx.beginPath();
+                ctx.moveTo(hipX, hipY);
+                ctx.lineTo(kneeX, kneeY);
+                ctx.strokeStyle = stroke;
+                ctx.lineWidth = 6;
+                ctx.stroke();
+
+                // lower leg
+                ctx.beginPath();
+                ctx.moveTo(kneeX, kneeY);
+                ctx.lineTo(footX, footY);
+                ctx.lineWidth = 5;
+                ctx.stroke();
+
+                // foot plate
+                if (t < 0.7) {
+                    ctx.beginPath();
+                    if (m.onGround) {
+                        ctx.moveTo(footX - 12, footY + 4);
+                        ctx.lineTo(footX + 12, footY + 4);
+                    } else {
+                        ctx.moveTo(footX - 10, footY + 6);
+                        ctx.lineTo(footX + 10, footY + 6);
+                    }
+                    ctx.lineWidth = 4;
+                    ctx.stroke();
+                }
+
+                // joints
+                ctx.beginPath();
+                ctx.arc(hipX,  hipY,  8, 0, 2 * Math.PI);
+                ctx.moveTo(kneeX + 5, kneeY);
+                ctx.arc(kneeX, kneeY, 5, 0, 2 * Math.PI);
+                ctx.fillStyle = "#ddd";
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.restore();
+            };
+
+            m.draw = function () {
+                m.walk_cycle += m.flipLegs * m.Vx;
+
+                // determine target ball-T this frame
+                const isCompact = m.sliding || m.rolling ||
+                    ((m.onWallLeft || m.onWallRight) && !m.onGround);
+                m._robotBallTgt = isCompact ? 1 : 0;
+                // smooth transition
+                const speed = isCompact ? 0.18 : 0.10;
+                m._robotBallT += (m._robotBallTgt - m._robotBallT) * speed;
+                const t = m._robotBallT;
+
+                ctx.save();
+                ctx.globalAlpha = (m.immuneCycle < m.cycle) ? 1
+                    : m.cycle % 3 ? 0.1 : 0.65 + 0.1 * Math.random();
+                ctx.translate(m.pos.x, m.pos.y);
+
+                // ── LEGS (drawn behind body) ───────────────────────────
+                m.calcLeg(Math.PI, -3);
+                m.drawLeg("#3a3a3a");
+                m.calcLeg(0, 0);
+                m.drawLeg("#555");
+
+                // ── BODY ──────────────────────────────────────────────
+                ctx.rotate(m.angle);
+
+                // body radius interpolates: standing=28, ball=30
+                const bodyR = 28 + 2 * t;
+
+                // standing: hexagonal torso; ball: pure circle
+                ctx.beginPath();
+                if (t < 0.05) {
+                    // hexagonal robot torso
+                    const sides = 6;
+                    for (let i = 0; i < sides; i++) {
+                        const a = (i / sides) * 2 * Math.PI - Math.PI / 6;
+                        const x = bodyR * Math.cos(a);
+                        const y = bodyR * Math.sin(a);
+                        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                    }
+                    ctx.closePath();
+                } else if (t > 0.95) {
+                    // pure circle
+                    ctx.arc(0, 0, bodyR, 0, 2 * Math.PI);
+                } else {
+                    // morphing: blend between hexagon and circle using arc approximation
+                    // draw a circle but slightly squash when mid-transition
+                    const squash = 1 - 0.15 * Math.sin(Math.PI * t);
+                    ctx.ellipse(0, 0, bodyR, bodyR * squash, 0, 0, 2 * Math.PI);
+                }
+
+                ctx.fillStyle = m.bodyGradient;
+                ctx.fill();
+                ctx.strokeStyle = "#222";
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // ── VISOR / EYE ───────────────────────────────────────
+                // The visor narrows and "closes" as the robot curls into ball mode
+                const visorW = (1 - t * 0.6) * 18;
+                const visorH = (1 - t * 0.5) * 6;
+                ctx.beginPath();
+                ctx.ellipse(13, 0, visorW * 0.5, visorH * 0.5, 0, 0, 2 * Math.PI);
+                const visorGrad = ctx.createLinearGradient(4, -4, 22, 4);
+                visorGrad.addColorStop(0, "#00e5ff");
+                visorGrad.addColorStop(1, "#0050a0");
+                ctx.fillStyle = visorGrad;
+                ctx.fill();
+                ctx.strokeStyle = "#001a33";
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                // spinning detail line when in ball mode (like a Sonic-style shine)
+                if (t > 0.5) {
+                    const spin = m.cycle * 0.08 * Math.sign(m.Vx || 1);
+                    ctx.save();
+                    ctx.rotate(spin);
+                    ctx.beginPath();
+                    ctx.moveTo(-bodyR * 0.55, 0);
+                    ctx.lineTo(bodyR * 0.55, 0);
+                    ctx.strokeStyle = `rgba(255,255,255,${0.25 * (t - 0.5) * 2})`;
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                // ── ANTENNA (only when standing) ──────────────────────
+                if (t < 0.8) {
+                    const antA = 1 - t / 0.8;
+                    ctx.save();
+                    ctx.globalAlpha *= antA;
+                    ctx.beginPath();
+                    ctx.moveTo(0, -bodyR);
+                    ctx.lineTo(-5, -bodyR - 12);
+                    ctx.strokeStyle = "#aaa";
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.arc(-5, -bodyR - 14, 3, 0, 2 * Math.PI);
+                    ctx.fillStyle = "#ff4444";
+                    ctx.fill();
+                    ctx.restore();
+                }
+
+                ctx.restore();
+                m.yOff = m.yOff * 0.82 + m.yOffGoal * 0.18;
+                powerUps.boost.draw();
+            };
         },
         mech() {
             m.isAltSkin = true
